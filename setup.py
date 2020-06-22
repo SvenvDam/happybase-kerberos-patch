@@ -7,8 +7,9 @@ setup(
     test_suite='tests',
     install_requires=[
         'pykerberos',
-        'thriftpy2==0.4.8',
+        'thriftpy2==0.4.11',
         'pure-sasl==0.6.1',
         'happybase==1.2.0',
+        'krbcontext~=0.10',
     ],
 )

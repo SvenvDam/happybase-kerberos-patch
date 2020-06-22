@@ -4,13 +4,15 @@ from struct import pack, unpack
 import base64
 from io import BytesIO
 import contextlib
+import functools
 import logging
 import socket
 import threading
 from six.moves import queue, range
 
 from thriftpy2.thrift import TClient, TException
-from thriftpy2.transport import TBufferedTransport, TFramedTransport, TSocket, TTransportBase, TTransportException, readall
+from thriftpy2.transport import TBufferedTransport, TFramedTransport, TSocket, TTransportBase, TTransportException
+from thriftpy2.transport.base import readall
 from thriftpy2.protocol import TBinaryProtocol, TCompactProtocol
 
 import puresasl
@@ -22,6 +24,9 @@ from Hbase_thrift import Hbase
 
 import kerberos
 from kerberos import KrbError
+
+from krbcontext import krbContext
+from gssapi.creds import rcred_cred_store
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,19 @@ class CustomGSSAPIMechanism(puresasl.mechanisms.GSSAPIMechanism):
         else:
             return outgoing
 
+
+def with_ticket(f):
+    @functools.wraps(f)
+    def wrapper(self, *args, **kwargs):
+        if self.generate_tickets:
+            with self.krb_context:
+                return f(self, *args, **kwargs)
+        else:
+            return f(self, *args, **kwargs)
+
+    return wrapper
+
+
 class TSaslClientTransport(TTransportBase):
     """
     SASL transport
@@ -55,6 +73,8 @@ class TSaslClientTransport(TTransportBase):
     COMPLETE = 5
 
     def __init__(self, transport, host, service, mechanism=six.u('GSSAPI'),
+                 generate_tickets=False, using_keytab=False, principal=None,
+                 keytab_file=None, ccache_file=None, password=None,
                  **sasl_kwargs):
         """
         transport: an underlying transport to use, typically just a TSocket
@@ -74,6 +94,11 @@ class TSaslClientTransport(TTransportBase):
         self.__wbuf = BytesIO()
         self.__rbuf = BytesIO()
 
+        self.generate_tickets = generate_tickets
+        if self.generate_tickets:
+            self.krb_context = krbContext(using_keytab, principal, keytab_file, ccache_file, password)
+            self.krb_context.init_with_keytab()
+
     def _patch_pure_sasl(self):
         ''' we need to patch pure_sasl to support python 3 '''
         puresasl.mechanisms.mechanisms['GSSAPI'] = CustomGSSAPIMechanism
@@ -81,6 +106,7 @@ class TSaslClientTransport(TTransportBase):
     def is_open(self):
         return self.transport.is_open() and bool(self.sasl)
 
+    @with_ticket
     def open(self):
         if not self.transport.is_open():
             self.transport.open()
@@ -123,9 +149,11 @@ class TSaslClientTransport(TTransportBase):
             payload = ""
         return status, payload
 
+    @with_ticket
     def write(self, data):
         self.__wbuf.write(data)
 
+    @with_ticket
     def flush(self):
         data = self.__wbuf.getvalue()
         encoded = self.sasl.wrap(data)
@@ -183,7 +211,10 @@ class KerberosConnection(Connection):
                  autoconnect=True, table_prefix=None,
                  table_prefix_separator=b'_', compat=DEFAULT_COMPAT,
                  transport=DEFAULT_TRANSPORT, protocol=DEFAULT_PROTOCOL,
-                 use_kerberos=False, sasl_service_name='hbase'):
+                 use_kerberos=False, sasl_service_name='hbase',
+                 generate_tickets=False, using_keytab=False,
+                 principal=None, keytab_file=None,
+                 ccache_file=None, password=None):
 
         if transport not in THRIFT_TRANSPORTS:
             raise ValueError("'transport' must be one of %s"
@@ -206,6 +237,17 @@ class KerberosConnection(Connection):
             raise ValueError("'protocol' must be one of %s"
                              % ", ".join(THRIFT_PROTOCOLS))
 
+        if generate_tickets and not use_kerberos:
+            raise ValueError("use_kerberos must be True if generate_tickets is True")
+
+        if generate_tickets and (rcred_cred_store is None):
+            print(rcred_cred_store)
+            raise NotImplementedError("Your GSSAPI implementation does "
+                                      "not have support for manipulating "
+                                      "credential stores directly. "
+                                      "Please create your kerberos tickets manually "
+                                      "e.g. with kinit")
+
         # Allow host and port to be None, which may be easier for
         # applications wrapping a Connection instance.
         self.host = host or DEFAULT_HOST
@@ -216,6 +258,12 @@ class KerberosConnection(Connection):
         self.compat = compat
         self.use_kerberos = use_kerberos
         self.sasl_service_name = sasl_service_name
+        self.generate_tickets = generate_tickets
+        self.using_keytab = using_keytab
+        self.principal = principal
+        self.keytab_file = keytab_file
+        self.ccache_file = ccache_file
+        self.password = password
 
         self._transport_class = THRIFT_TRANSPORTS[transport]
         self._protocol_class = THRIFT_PROTOCOLS[protocol]
@@ -234,7 +282,17 @@ class KerberosConnection(Connection):
 
         self.transport = self._transport_class(socket)
         if self.use_kerberos:
-            self.transport = TSaslClientTransport(self.transport, self.host, self.sasl_service_name)
+            self.transport = TSaslClientTransport(
+                self.transport,
+                self.host,
+                self.sasl_service_name,
+                generate_tickets=self.generate_tickets,
+                using_keytab=self.using_keytab,
+                principal=self.principal,
+                keytab_file=self.keytab_file,
+                ccache_file=self.ccache_file,
+                password=self.password
+            )
         protocol = self._protocol_class(self.transport, decode_response=False)
         self.client = TClient(Hbase, protocol)
 
